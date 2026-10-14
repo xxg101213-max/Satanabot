@@ -13,6 +13,7 @@ from telegram import Update, InputFile, ReplyKeyboardMarkup, InlineKeyboardButto
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from .core import inspect, read_entry, category_for
 from .migrate import migrate_json
+from .binary_migrate import migrate_anchored, UnsafeMigration
 from .planner import pretty_plan, make_plan
 from .brain import explain_request, provider_status, MODES
 from .workspace import workspace_zip
@@ -134,7 +135,9 @@ async def ai_respond(update: Update, question: str):
         output += '\n\nAvisos: ' + '; '.join(answer.warnings)
     for i in range(0, len(output), 3700):
         await update.effective_message.reply_text(output[i:i+3700])
-    state_set(uid, {})
+    # Conversar com a IA não deve cancelar uma atualização em andamento.
+    if read_state(uid).get('mode') == 'await_ai_request':
+        state_set(uid, {})
 
 
 async def test_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -153,11 +156,14 @@ async def authorized(update:Update)->bool:
 
 async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await authorized(update): return
-    await update.message.reply_text('SATANABE AI BUILDER v0.5\n\n/construir — receber Assembly e compilar módulo ESP\n/agente — DeepSeek/Groq chama ferramentas permitidas de análise\n/empacotar BUNDLE CAMINHO — gerar .3105 real a partir de arquivo\n/trocartexto ANTIGO | NOVO — substituir texto único em Assembly .NET\n/analisar — inspecionar arquivo/workspace\n/extrair — abrir .3105 e receber ZIP\n/atualizar — migrar alterações simples em JSON e .NET gerenciado\n/criar — planejar alterações\n/esp — configurações e DLL compilada\n/ia — DeepSeek ou Groq\n/modelo deepseek | groq | auto | dupla — escolher IA\n/statusia — status\n/testaria — testar a IA selecionada\n/senha — abrir pacote com senha\n/cancelar — limpar sessão\n\nESP compilada exige ligação ao jogo. IL2CPP/Unity nativo não admite edição automática genérica.',reply_markup=MENU)
+    await update.message.reply_text('SATANABE AI BUILDER v0.6\n\n/construir — receber Assembly e compilar módulo ESP\n/agente — DeepSeek/Groq chama ferramentas permitidas de análise\n/empacotar BUNDLE CAMINHO — gerar .3105 real a partir de arquivo\n/trocartexto ANTIGO | NOVO — substituir texto único em Assembly .NET\n/analisar — inspecionar arquivo/workspace\n/extrair — abrir .3105 e receber ZIP\n/atualizar — migrar alterações simples em JSON e .NET gerenciado\n/criar — planejar alterações\n/esp — configurações e DLL compilada\n/ia — DeepSeek ou Groq\n/modelo deepseek | groq | auto | dupla — escolher IA\n/statusia — status\n/testaria — testar a IA selecionada\n/senha — abrir pacote com senha\n/etapa — mostrar próximo arquivo da atualização\n/cancelar — limpar sessão\n\nESP compilada exige ligação ao jogo. IL2CPP/Unity nativo não admite edição automática genérica.',reply_markup=MENU)
 
 
 async def analyze(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await authorized(update): return
+    if read_state(update.effective_user.id).get('mode') in ('await_package','await_updated','await_old_original','await_selection','await_3105_password'):
+        await update.effective_message.reply_text('Você já tem uma atualização em andamento. Envie o próximo arquivo solicitado; use /etapa para consultar ou /cancelar para sair. O projeto não foi apagado.')
+        return
     state_set(update.effective_user.id, {'mode':'inspect'})
     await update.message.reply_text('Envie um arquivo (.3105, .bytes, cache_res, Assetindexer) ou um ZIP com o workspace exportado pelo 3105.')
 
@@ -171,7 +177,20 @@ async def extract_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def update_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await authorized(update): return
     state_set(update.effective_user.id, {'mode':'await_package'})
-    await update.message.reply_text('Envie o .3105 ou ZIP de workspace contendo a versão antiga modificada.\n\nDepois pedirei a versão nova e, para migração confiável, a antiga original. Para binários desconhecidos, só farei inspeção e relatório.')
+    await update.message.reply_text('Envie o .3105 ou ZIP com o Assembly antigo MODIFICADO.\n\nDepois solicitarei a versão NOVA e a versão ANTIGA ORIGINAL (sem mod). Essa comparação de três versões é necessária para descobrir alterações reais. Arquivos binários só serão alterados se as correspondências forem verificadas.')
+
+
+async def etapa_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    if not await authorized(update): return
+    state=read_state(update.effective_user.id)
+    steps={
+        'await_package':'Envie o .3105 antigo modificado.',
+        'await_selection':'Escolha um arquivo com /selecionar 1.',
+        'await_updated':'Envie o Assembly atualizado (ou cache_res/Assetindexer correspondente).',
+        'await_old_original':'Envie a versão antiga ORIGINAL, sem mods; ela permite reconhecer as alterações.',
+        'await_3105_password':'Pacote protegido: precisa da senha original.',
+    }
+    await update.effective_message.reply_text('Etapa atual: '+steps.get(state.get('mode'),'Nenhuma atualização em andamento. Use /atualizar.'))
 
 
 async def create(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -400,7 +419,7 @@ async def file_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
         path.unlink(missing_ok=True)
         await msg.reply_text('Arquivo excede limite permitido.')
         return
-    details=inspect(path)
+    details=inspect(path, display_name=doc.file_name or path.name)
     if details.kind=='3105_protegido':
         state_set(uid,{'mode':'await_3105_password', 'previous_mode':state.get('mode','inspect'), 'package_path':str(path)})
         await msg.reply_text('🔒 Este .3105 possui senha. Envie /senha SUA_SENHA para abrir, ou /cancelar. '
@@ -553,8 +572,8 @@ async def process_file(msg, uid, state, path, details, original_filename):
         if details.kind in ('3105_opaco','3105_invalido'):
             await msg.reply_text('Envie o arquivo atualizado extraído, não outro pacote .3105 desconhecido.')
             return
-        if details.kind=='workspace_zip':
-            await msg.reply_text('Envie somente o arquivo atualizado desejado (Assembly, cache_res ou Assetindexer).')
+        if details.kind!='arquivo_solto':
+            await msg.reply_text('Envie somente o arquivo atualizado individual (Assembly, cache_res ou Assetindexer).')
             return
         current=details.entries[0].category
         if current!=state.get('category'):
@@ -562,7 +581,7 @@ async def process_file(msg, uid, state, path, details, original_filename):
             return
         state.update(mode='await_old_original', updated=str(path), updated_name=original_filename)
         state_set(uid,state)
-        await msg.reply_text('Versão nova recebida. Envie agora a versão ANTIGA ORIGINAL, sem modificações.\n\nCom três versões consigo isolar mudanças com mais segurança. Se for um binário desconhecido, entregarei um relatório, sem alterar bytes arbitrariamente.')
+        await msg.reply_text('✅ Assembly novo recebido. Agora envie o Assembly ANTIGO ORIGINAL, sem o painel nem ESP.\n\nVou comparar 3 versões. Se encontrar mudanças compatíveis, tento migrá-las; caso contrário explicarei quais âncoras ou estruturas faltaram, sem inventar um patch.')
         return
     if mode=='await_old_original':
         if details.kind!='arquivo_solto':
@@ -587,7 +606,7 @@ async def process_file(msg, uid, state, path, details, original_filename):
                 if diagnosis.get('applied',0)>0:
                     patched=out_file.read_bytes()
                     await _send_bytes(msg,patched,state.get('updated_name','Assembly-CSharp-patch.bytes'),'Literal CIL migrado; requires in-game compatibility validation.')
-                    target=await _bundle_from_entry(state['entry_name'])
+                    target=_bundle_from_entry(state['entry_name'])
                     if target:
                         binary=create3105([(target[0],target[1],patched)],name='Satanabe Assembly Atualizado')
                         await _send_bytes(msg,binary,'Satanabe_Assembly_Atualizado.3105','Pacote gerado e reaberto, mas ainda não testado no jogo.')
@@ -622,9 +641,20 @@ async def process_file(msg, uid, state, path, details, original_filename):
                     except ValueError:
                         report['workspace']='Não gerado: Bundle ID/caminho ausente.'
         except (UnicodeError,ValueError,TypeError,json.JSONDecodeError):
-            report['status']='BINARIO_SEM_ADAPTADOR'
-            report['reason']='O arquivo não é JSON compatível. Uma migração de Assembly/Unity AssetBundle exige parser e receita estruturais específicos; não foi feita alteração automática.'
-            await msg.reply_text('Arquivos analisados, mas não apliquei mudanças: este formato não tem um adaptador seguro implementado. Vou enviar o relatório de identificação.')
+            try:
+                migrated,diagnostics=migrate_anchored(old_original,old_modified,new_original)
+                report.update(diagnostics)
+                await _send_bytes(msg,migrated,state.get('updated_name','arquivo-atualizado.bytes'),
+                                  'Migração por âncoras únicas. NÃO significa que painel/ESP foram validados no jogo.')
+                target=_bundle_from_entry(state['entry_name'])
+                if target:
+                    package=create3105([(target[0],target[1],migrated)],name='Satanabe Atualizacao Binaria')
+                    await _send_bytes(msg,package,'Satanabe_Migracao_Condicional.3105',
+                                      'Pacote válido estruturalmente; funcionamento no jogo não testado.')
+            except (UnsafeMigration,Patch3105Error) as exc:
+                report['status']='INCOMPATIVEL_PARA_MIGRACAO_AUTOMATICA'
+                report['reason']=str(exc)[:600]
+                await msg.reply_text('Não foi seguro reaplicar as modificações binárias na nova versão: '+str(exc)[:600]+'\nNão gerei um patch supostamente funcional.')
         if provider_status()['deepseek'] or provider_status()['groq']:
             evidence={'category':report['category'],'status':report['status'],
                       'sizes':{'old_modified':report['old_modified_size'],'old_original':report['baseline_size'],'new_original':report['new_size']},
@@ -704,6 +734,7 @@ def main():
     app.add_handler(CommandHandler('analisar',analyze))
     app.add_handler(CommandHandler('extrair',extract_cmd))
     app.add_handler(CommandHandler('atualizar',update_cmd))
+    app.add_handler(CommandHandler('etapa',etapa_cmd))
     app.add_handler(CommandHandler('criar',create))
     app.add_handler(CommandHandler('construir',construir_cmd))
     app.add_handler(CommandHandler('agente',agente_cmd))

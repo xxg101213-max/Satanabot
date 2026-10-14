@@ -73,7 +73,9 @@ def safe_name(name: str):
     return bool(name) and not q.is_absolute() and '..' not in q.parts and not name.startswith('~') and ':' not in q.parts[0]
 
 
-def inspect(path: Path) -> Inspection:
+def inspect(path: Path, display_name: str | None = None) -> Inspection:
+    """Inspect bytes stored under UUID filenames while honoring Telegram original name."""
+    filename = PurePosixPath(display_name or path.name).name
     digest = file_hash(path)
     if path.suffix.lower()=='.3105':
         prefix=path.read_bytes()[:16]
@@ -83,17 +85,17 @@ def inspect(path: Path) -> Inspection:
                 entries=[Entry(item['name'], category_for(item['name']), len(item['data']),
                               hashlib.sha256(item['data']).hexdigest(),sniff(item['data'][:65536],item['name'].lower()))
                          for item in package['files']]
-                return Inspection('3105_decodificado',path.name,digest,entries,
+                return Inspection('3105_decodificado',filename,digest,entries,
                                   f'Pacote aberto e hashes validados; {len(entries)} arquivo(s). ' 
                                   'Edição de binários ainda exige um adaptador específico.')
             except PasswordNeeded:
                 info=summary3105(path.read_bytes())
-                return Inspection('3105_protegido',path.name,digest,[],
+                return Inspection('3105_protegido',filename,digest,[],
                                   f'Pacote v{info["schema_version"]} protegido por senha. '
                                   'É necessária a senha original para ler os arquivos.')
             except Patch3105Error as exc:
-                return Inspection('3105_invalido',path.name,digest,[],str(exc))
-        return Inspection('3105_opaco',path.name,digest,[],
+                return Inspection('3105_invalido',filename,digest,[],str(exc))
+        return Inspection('3105_opaco',filename,digest,[],
                           'Formato .3105 desconhecido para o leitor v1-v3. Envie workspace exportado pelo aplicativo.')
     if zipfile.is_zipfile(path):
         entries = []
@@ -101,22 +103,22 @@ def inspect(path: Path) -> Inspection:
         with zipfile.ZipFile(path) as z:
             infos = [i for i in z.infolist() if not i.is_dir()]
             if len(infos) > LIMIT_FILES:
-                return Inspection('rejeitado',path.name,digest,[], 'Arquivo contém entradas demais.')
+                return Inspection('rejeitado',filename,digest,[], 'Arquivo contém entradas demais.')
             for info in infos:
                 total += info.file_size
                 if not safe_name(info.filename) or total > LIMIT_BYTES or info.file_size > LIMIT_BYTES:
-                    return Inspection('rejeitado',path.name,digest,[], 'ZIP inseguro ou acima do limite de expansão.')
+                    return Inspection('rejeitado',filename,digest,[], 'ZIP inseguro ou acima do limite de expansão.')
                 with z.open(info) as stream:
                     first = stream.read(min(info.file_size, 65536))
                 entries.append(Entry(info.filename, category_for(info.filename), info.file_size, signature=sniff(first,info.filename.lower())))
         found = [e for e in entries if e.category!='outro']
-        return Inspection('workspace_zip',path.name,digest,entries,
+        return Inspection('workspace_zip',filename,digest,entries,
                           f'{len(found)} arquivo(s) reconhecido(s). ZIP/workspace não é necessariamente pacote .3105 válido.')
     with path.open('rb') as f:
         prefix=f.read(65536)
-    category=category_for(path.name)
-    return Inspection('arquivo_solto',path.name,digest,
-                      [Entry(path.name,category,path.stat().st_size,digest,sniff(prefix,path.name.lower()))],
+    category=category_for(filename)
+    return Inspection('arquivo_solto',filename,digest,
+                      [Entry(filename,category,path.stat().st_size,digest,sniff(prefix,filename.lower()))],
                       'Classificação por caminho/nome e assinatura; não comprova semântica interna.')
 
 
