@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass, asdict
 from pathlib import Path, PurePosixPath
 import zipfile
+from .patch3105 import MAGIC, Patch3105Error, PasswordNeeded, decode as decode3105, summary as summary3105
 
 LIMIT_BYTES = 256 * 1024 * 1024
 LIMIT_FILES = 4000
@@ -74,6 +75,26 @@ def safe_name(name: str):
 
 def inspect(path: Path) -> Inspection:
     digest = file_hash(path)
+    if path.suffix.lower()=='.3105':
+        prefix=path.read_bytes()[:16]
+        if prefix.startswith(MAGIC):
+            try:
+                package=decode3105(path.read_bytes())
+                entries=[Entry(item['name'], category_for(item['name']), len(item['data']),
+                              hashlib.sha256(item['data']).hexdigest(),sniff(item['data'][:65536],item['name'].lower()))
+                         for item in package['files']]
+                return Inspection('3105_decodificado',path.name,digest,entries,
+                                  f'Pacote aberto e hashes validados; {len(entries)} arquivo(s). ' 
+                                  'Edição de binários ainda exige um adaptador específico.')
+            except PasswordNeeded:
+                info=summary3105(path.read_bytes())
+                return Inspection('3105_protegido',path.name,digest,[],
+                                  f'Pacote v{info["schema_version"]} protegido por senha. '
+                                  'É necessária a senha original para ler os arquivos.')
+            except Patch3105Error as exc:
+                return Inspection('3105_invalido',path.name,digest,[],str(exc))
+        return Inspection('3105_opaco',path.name,digest,[],
+                          'Formato .3105 desconhecido para o leitor v1-v3. Envie workspace exportado pelo aplicativo.')
     if zipfile.is_zipfile(path):
         entries = []
         total = 0
@@ -94,15 +115,17 @@ def inspect(path: Path) -> Inspection:
     with path.open('rb') as f:
         prefix=f.read(65536)
     category=category_for(path.name)
-    if path.suffix.lower()=='.3105':
-        return Inspection('3105_opaco',path.name,digest,[],
-                          'Pacote .3105 não legível como ZIP. Pode estar criptografado: exporte o workspace pelo aplicativo 3105. Nenhum conteúdo interno foi presumido.')
     return Inspection('arquivo_solto',path.name,digest,
                       [Entry(path.name,category,path.stat().st_size,digest,sniff(prefix,path.name.lower()))],
                       'Classificação por caminho/nome e assinatura; não comprova semântica interna.')
 
 
 def read_entry(path: Path, entry_name: str) -> bytes:
+    if path.suffix.lower()=='.3105' and path.read_bytes().startswith(MAGIC):
+        for entry in decode3105(path.read_bytes())['files']:
+            if entry['name']==entry_name:
+                return entry['data']
+        raise ValueError('Arquivo não encontrado no pacote')
     if not zipfile.is_zipfile(path):
         return path.read_bytes()
     if not safe_name(entry_name):
